@@ -1,0 +1,6 @@
+{
+  "name": "VoiceShield",
+  "description": "AI-powered real-time voice cloning detection and impersonation prevention guide for students. Record or upload audio to check whether a voice is real or AI-generated.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
