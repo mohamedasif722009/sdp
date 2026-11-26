@@ -1,7 +1,6 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import express from 'express';
-import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -19,6 +18,7 @@ function getAiClient(): GoogleGenAI {
   }
   return new GoogleGenAI({
     apiKey,
+    apiVersion: 'v1beta',
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -27,13 +27,43 @@ function getAiClient(): GoogleGenAI {
   });
 }
 
-function normalizeMimeType(rawMime: string): string {
+function detectMimeFromBuffer(buf: Buffer): string | null {
+  if (buf.length < 12) return null;
+  const ascii4 = buf.subarray(0, 4).toString('ascii');
+  if (ascii4 === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WAVE') {
+    return 'audio/wav';
+  }
+  if (ascii4 === 'OggS') return 'audio/ogg';
+  if (ascii4 === 'fLaC') return 'audio/flac';
+  if (buf.subarray(0, 3).toString('ascii') === 'ID3') return 'audio/mp3';
+  if (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) return 'audio/mp3';
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) {
+    return 'audio/webm';
+  }
+  if (buf.subarray(4, 8).toString('ascii') === 'ftyp') {
+    return 'audio/mp4';
+  }
+  return null;
+}
+
+function normalizeMimeType(rawMime: string, fileName?: string, base64Data?: string): string {
+  if (base64Data) {
+    try {
+      const headBytes = Buffer.from(base64Data.slice(0, 64), 'base64');
+      const detected = detectMimeFromBuffer(headBytes);
+      if (detected) return detected;
+    } catch {
+      // ignore
+    }
+  }
+
   const base = rawMime.split(';')[0].trim().toLowerCase();
+  if (base === 'audio/x-wav' || base === 'audio/wave') return 'audio/wav';
+  if (base === 'audio/mpeg') return 'audio/mp3';
+  if (base === 'audio/x-m4a' || base === 'audio/m4a' || base === 'video/mp4') return 'audio/mp4';
+
   const allowed = new Set([
     'audio/wav',
-    'audio/x-wav',
-    'audio/wave',
-    'audio/mpeg',
     'audio/mp3',
     'audio/webm',
     'audio/ogg',
@@ -41,11 +71,54 @@ function normalizeMimeType(rawMime: string): string {
     'audio/aac',
     'audio/flac',
   ]);
-  if (base === 'audio/x-wav' || base === 'audio/wave') return 'audio/wav';
-  if (base === 'audio/mpeg') return 'audio/mp3';
   if (allowed.has(base)) return base;
-  return 'audio/webm';
+
+  if (fileName) {
+    const lower = fileName.toLowerCase();
+    if (lower.endsWith('.wav')) return 'audio/wav';
+    if (lower.endsWith('.mp3')) return 'audio/mp3';
+    if (lower.endsWith('.ogg') || lower.endsWith('.opus')) return 'audio/ogg';
+    if (lower.endsWith('.webm')) return 'audio/webm';
+    if (lower.endsWith('.flac')) return 'audio/flac';
+    if (lower.endsWith('.aac')) return 'audio/aac';
+    if (lower.endsWith('.m4a') || lower.endsWith('.mp4')) return 'audio/mp4';
+  }
+
+  return 'audio/wav';
 }
+
+function formatReadableError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? 'Failed to analyze audio.');
+  try {
+    const parsed = JSON.parse(raw);
+    const nestedMsg = parsed?.error?.message;
+    if (typeof nestedMsg === 'string' && nestedMsg.length > 0) {
+      return nestedMsg;
+    }
+  } catch {
+    // not JSON
+  }
+  if (raw.includes('503') || raw.includes('UNAVAILABLE')) {
+    return 'The voice analysis service is temporarily busy. Please try again in a few seconds.';
+  }
+  return raw;
+}
+
+function isRetryableError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return (
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('429') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('high demand') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('timed out')
+  );
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const SAMPLE_SCENARIOS: Record<
   string,
@@ -89,7 +162,7 @@ const SAMPLE_SCENARIOS: Record<
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '25mb' }));
+  app.use(express.json({ limit: '40mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
@@ -97,13 +170,17 @@ async function startServer() {
 
   app.post('/api/analyze-voice', async (req, res) => {
     try {
-      const { audioBase64, mimeType, signalStats } = req.body ?? {};
+      const { audioBase64, mimeType, fileName, signalStats } = req.body ?? {};
       if (!audioBase64 || typeof audioBase64 !== 'string') {
         res.status(400).json({ error: 'Missing audio data. Please record or upload an audio clip first.' });
         return;
       }
 
-      const normalizedMime = normalizeMimeType(typeof mimeType === 'string' ? mimeType : 'audio/webm');
+      const normalizedMime = normalizeMimeType(
+        typeof mimeType === 'string' ? mimeType : '',
+        typeof fileName === 'string' ? fileName : undefined,
+        audioBase64
+      );
       const ai = getAiClient();
 
       const statsDescription = signalStats
@@ -115,156 +192,228 @@ async function startServer() {
 - Spectral flatness: ${Number(signalStats.spectralFlatness ?? 0).toFixed(3)}`
         : 'No pre-extracted signal metrics provided.';
 
-      const prompt = `You are VoiceShield, an audio forensics and student cybersecurity assistant helping students determine whether a voice recording is a REAL HUMAN speaker or LIKELY FAKE / AI-CLONED speech, and spot voice impersonation scams.
+      const prompt = `You are VoiceShield, helping students check if a voice clip is a REAL HUMAN speaker or LIKELY FAKE / AI-CLONED speech, and spot impersonation scams.
 
-Carefully listen to the attached audio recording and inspect both:
-1. Acoustic and vocal authenticity clues:
-   - Natural breathing, inhales, mouth clicks, micro-hesitations, and organic pacing vs. unnaturally smooth or uniform cadence.
-   - Prosody, pitch contour, and emotional resonance vs. synthetic vocoder artifacts, metallic high-frequency ringing, flat phrasing, or robotic word boundaries.
-   - Room acoustics and background noise continuity vs. sterile studio silence or abrupt gating between words.
-2. Social-engineering and impersonation scam clues in the spoken words:
-   - Artificial urgency ("right now", "within 10 minutes"), secrecy ("don't tell anyone"), requests for money/transfers/gift cards, requests for 2FA/one-time passcodes, or fake authority claims.
+Listen to the audio and evaluate:
+1. Acoustic clues: natural inhales/micro-pauses/hesitations and natural vocal pitch variation vs. overly smooth cadence, flat pitch, robotic boundaries, or sterile gating.
+2. Scam triggers: urgency ("right now"), secrecy ("don't tell anyone"), money/gift-card transfers, 2FA/passcode requests, or fake authority.
 
 ${statsDescription}
 
-Rules for your verdict:
-- If the audio is too short (< 1.5 seconds), silent, or unintelligible noise, set verdict to "UNCERTAIN" and explain clearly that a longer 4-10 second clear speech sample is needed.
-- Never exaggerate certainty: give an honest confidence integer between 0 and 100.
-- Keep all explanations simple, clear, and jargon-free so any high school or college student can immediately understand what to do.`;
+Rules:
+- If < 1.5s, silent, or unintelligible noise, return verdict "UNCERTAIN" and ask for 4-10s of clear speech.
+- Give an honest confidence integer (0-100).
+- Keep headline, summary, 3 acousticClues, and 3 preventionSteps short and easy for a student to read.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: normalizedMime,
-                data: audioBase64,
-              },
-            },
-            { text: prompt },
-          ],
-        },
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              verdict: {
-                type: Type.STRING,
-                description: 'Must be exactly one of: REAL_HUMAN, LIKELY_FAKE, UNCERTAIN',
-              },
-              confidence: {
-                type: Type.INTEGER,
-                description: 'Confidence score from 0 to 100',
-              },
-              headline: {
-                type: Type.STRING,
-                description: 'Clear 4-9 word headline summarizing the result for a student',
-              },
-              summary: {
-                type: Type.STRING,
-                description: 'Simple 2-3 sentence plain-language explanation of why the voice appears real, fake, or uncertain.',
-              },
-              transcript: {
-                type: Type.STRING,
-                description: 'Accurate transcript of the spoken words, or "[No clear speech detected]" if none.',
-              },
-              impersonationRisk: {
-                type: Type.STRING,
-                description: 'Must be exactly one of: LOW, MEDIUM, HIGH',
-              },
-              scamSignals: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: 'List of social-engineering red flags heard in the message (empty array if none).',
-              },
-              acousticClues: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    observation: { type: Type.STRING },
-                    status: {
-                      type: Type.STRING,
-                      description: 'One of: human, suspicious, neutral',
+      const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
+      let responseText = '';
+      let lastError: unknown = null;
+
+      for (let i = 0; i < modelsToTry.length; i += 1) {
+        const model = modelsToTry[i];
+        try {
+          const timeoutPromise = new Promise<never>((_resolve, reject) => {
+            setTimeout(() => reject(new Error(`Model ${model} timed out.`)), 8000);
+          });
+
+          const response = await Promise.race([
+            ai.models.generateContent({
+              model,
+              contents: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: normalizedMime,
+                      data: audioBase64,
                     },
                   },
-                  required: ['title', 'observation', 'status'],
+                  { text: prompt },
+                ],
+              },
+              config: {
+                thinkingConfig: {
+                  thinkingLevel:
+                    model === 'gemini-3.1-flash-lite'
+                      ? ThinkingLevel.MINIMAL
+                      : ThinkingLevel.LOW,
                 },
-                description: '3 to 4 concrete acoustic clues observable in the audio.',
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    verdict: {
+                      type: Type.STRING,
+                      description: 'Must be exactly one of: REAL_HUMAN, LIKELY_FAKE, UNCERTAIN',
+                    },
+                    confidence: {
+                      type: Type.INTEGER,
+                      description: 'Confidence score from 0 to 100',
+                    },
+                    headline: {
+                      type: Type.STRING,
+                      description: 'Clear 4-9 word headline summarizing the result for a student',
+                    },
+                    summary: {
+                      type: Type.STRING,
+                      description: 'Simple 2-3 sentence plain-language explanation of why the voice appears real, fake, or uncertain.',
+                    },
+                    transcript: {
+                      type: Type.STRING,
+                      description: 'Accurate transcript of the spoken words, or "[No clear speech detected]" if none.',
+                    },
+                    impersonationRisk: {
+                      type: Type.STRING,
+                      description: 'Must be exactly one of: LOW, MEDIUM, HIGH',
+                    },
+                    scamSignals: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
+                      description: 'List of social-engineering red flags heard in the message (empty array if none).',
+                    },
+                    acousticClues: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          title: { type: Type.STRING },
+                          observation: { type: Type.STRING },
+                          status: {
+                            type: Type.STRING,
+                            description: 'One of: human, suspicious, neutral',
+                          },
+                        },
+                        required: ['title', 'observation', 'status'],
+                      },
+                      description: '3 to 4 concrete acoustic clues observable in the audio.',
+                    },
+                    preventionSteps: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
+                      description: '3 short, practical action steps the student should take right now.',
+                    },
+                  },
+                  required: [
+                    'verdict',
+                    'confidence',
+                    'headline',
+                    'summary',
+                    'transcript',
+                    'impersonationRisk',
+                    'scamSignals',
+                    'acousticClues',
+                    'preventionSteps',
+                  ],
+                },
               },
-              preventionSteps: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: '3 short, practical action steps the student should take right now.',
-              },
-            },
-            required: [
-              'verdict',
-              'confidence',
-              'headline',
-              'summary',
-              'transcript',
-              'impersonationRisk',
-              'scamSignals',
-              'acousticClues',
-              'preventionSteps',
-            ],
-          },
-        },
-      });
+            }),
+            timeoutPromise,
+          ]);
 
-      const rawText = (response.text ?? '').trim();
-      if (!rawText) {
+          responseText = (response.text ?? '').trim();
+          if (responseText) break;
+        } catch (err) {
+          lastError = err;
+          if (!isRetryableError(err) || i === modelsToTry.length - 1) {
+            throw err;
+          }
+          await sleep(400);
+        }
+      }
+
+      if (!responseText) {
+        if (lastError) throw lastError;
         res.status(502).json({ error: 'The analysis model returned an empty response. Please try again.' });
         return;
       }
 
-      const parsed = JSON.parse(rawText);
+      const cleanedJson = responseText
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+      const parsed = JSON.parse(cleanedJson);
       res.json(parsed);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to analyze audio.';
+      const message = formatReadableError(err);
       console.error('Analyze voice error:', message);
       const statusCode =
-        message.includes('GEMINI_API_KEY') ? 500 : message.includes('403') || message.includes('400') ? 400 : 500;
+        message.includes('GEMINI_API_KEY')
+          ? 500
+          : message.includes('403') || message.includes('400')
+            ? 400
+            : isRetryableError(err)
+              ? 503
+              : 500;
       res.status(statusCode).json({ error: message });
     }
   });
 
   app.post('/api/generate-sample', async (req, res) => {
     try {
-      const { scenarioId } = req.body ?? {};
-      const scenario = SAMPLE_SCENARIOS[String(scenarioId)] ?? SAMPLE_SCENARIOS.friend_emergency;
+      const { scenarioId, customScript, customVoice, customStyle, customTitle } = req.body ?? {};
+      const baseScenario =
+        SAMPLE_SCENARIOS[String(scenarioId)] ?? SAMPLE_SCENARIOS.friend_emergency;
+
+      const allowedVoices = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr']);
+      const scriptText =
+        typeof customScript === 'string' && customScript.trim().length > 0
+          ? customScript.trim().slice(0, 500)
+          : baseScenario.script;
+      const voiceName =
+        typeof customVoice === 'string' && allowedVoices.has(customVoice)
+          ? (customVoice as 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr')
+          : baseScenario.voiceName;
+      const styleText =
+        typeof customStyle === 'string' && customStyle.trim().length > 0
+          ? customStyle.trim().slice(0, 120)
+          : baseScenario.style;
+      const titleText =
+        typeof customTitle === 'string' && customTitle.trim().length > 0
+          ? customTitle.trim().slice(0, 80)
+          : typeof customScript === 'string' && customScript.trim().length > 0
+            ? 'Custom AI Test Clip'
+            : baseScenario.title;
+      const contextNote =
+        typeof customScript === 'string' && customScript.trim().length > 0
+          ? `Generated from your custom script using AI voice "${voiceName}".`
+          : baseScenario.contextNote;
+
       const ai = getAiClient();
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
-        contents: [
-          {
-            role: 'user',
-            parts: [
+      let audioPart: { data?: string; mimeType?: string } | undefined;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const response = await ai.models.generateContent({
+            model: 'gemini-3.8-flash-lite-tts',
+            contents: [
               {
-                text: scenario.script,
-                speechMetadata: {
-                  style: scenario.style,
-                },
+                role: 'user',
+                parts: [
+                  {
+                    text: scriptText,
+                    speechMetadata: {
+                      style: styleText,
+                    },
+                  },
+                ],
               },
             ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: scenario.voiceName },
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName },
+                },
+              },
             },
-          },
-        },
-      });
+          });
+          audioPart = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+          if (audioPart?.data) break;
+        } catch (err) {
+          if (!isRetryableError(err) || attempt === 1) throw err;
+          await sleep(700);
+        }
+      }
 
-      const audioPart = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
       if (!audioPart?.data) {
         res.status(502).json({ error: 'Could not generate sample audio right now.' });
         return;
@@ -273,12 +422,12 @@ Rules for your verdict:
       res.json({
         audioBase64: audioPart.data,
         mimeType: audioPart.mimeType || 'audio/wav',
-        title: scenario.title,
-        contextNote: scenario.contextNote,
-        expectedType: scenario.expectedType,
+        title: titleText,
+        contextNote,
+        expectedType: baseScenario.expectedType,
       });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to generate AI sample audio.';
+      const message = formatReadableError(err);
       console.error('Generate sample error:', message);
       res.status(500).json({ error: message });
     }

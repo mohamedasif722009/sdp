@@ -1,14 +1,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
   FileAudio,
   HelpCircle,
   Loader2,
   Mic,
   Pause,
+  Pencil,
   Play,
   RotateCcw,
+  Scissors,
   ShieldCheck,
   Square,
   Upload,
@@ -24,6 +27,8 @@ import {
   base64ToBlob,
   blobToBase64,
   formatDuration,
+  inferAudioMimeType,
+  trimAudioBlobToWav,
 } from '../utils/audioAnalysis';
 
 type InputMode = 'record' | 'upload' | 'sample';
@@ -68,12 +73,32 @@ export const VoiceChecker: React.FC = () => {
   const [mode, setMode] = useState<InputMode>('record');
 
   // Audio clip state
+  const [rawSourceBlob, setRawSourceBlob] = useState<Blob | null>(null);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [clipLabel, setClipLabel] = useState<string>('');
   const [clipNote, setClipNote] = useState<string>('');
   const [waveformPeaks, setWaveformPeaks] = useState<number[]>([]);
   const [signalStats, setSignalStats] = useState<SignalStats | null>(null);
+
+  // Clip editing & trimming state
+  const [isEditingClip, setIsEditingClip] = useState(false);
+  const [draftLabel, setDraftLabel] = useState('');
+  const [trimStart, setTrimStart] = useState(0);
+  const [trimEnd, setTrimEnd] = useState(0);
+  const [isTrimming, setIsTrimming] = useState(false);
+
+  // Custom AI script editor state
+  const [showCustomScript, setShowCustomScript] = useState(false);
+  const [customScript, setCustomScript] = useState(
+    "Hey, it's me, I forgot my wallet at the library. Can you send forty dollars right now?"
+  );
+  const [customVoice, setCustomVoice] = useState<'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr'>('Puck');
+  const [customStyle, setCustomStyle] = useState('Urgent, casual college student');
+
+  // Transcript edit state
+  const [isEditingTranscript, setIsEditingTranscript] = useState(false);
+  const [draftTranscript, setDraftTranscript] = useState('');
 
   // Recording state
   const [isRecording, setIsRecording] = useState(false);
@@ -195,12 +220,14 @@ export const VoiceChecker: React.FC = () => {
 
       try {
         const audioBase64 = await blobToBase64(blobToAnalyze);
+        const resolvedMime = inferAudioMimeType(label, blobToAnalyze.type || '');
         const response = await fetch('/api/analyze-voice', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             audioBase64,
-            mimeType: blobToAnalyze.type || 'audio/webm',
+            mimeType: resolvedMime,
+            fileName: label,
             signalStats: computedStats,
           }),
         });
@@ -253,35 +280,63 @@ export const VoiceChecker: React.FC = () => {
       setPlayProgress(0);
       setAnalysisError(null);
       setResult(null);
+      if (autoAnalyze) {
+        setIsAnalyzing(true);
+      }
 
       const url = URL.createObjectURL(blob);
-      setAudioBlob(blob);
+      setRawSourceBlob(blob);
       setAudioUrl(url);
       setClipLabel(label);
+      setDraftLabel(label);
       setClipNote(note);
+      setIsEditingClip(false);
+      setIsEditingTranscript(false);
 
       let stats: SignalStats | null = null;
       let peaks: number[] = [];
+      let blobForAnalysis = blob;
+      let decodedOk = false;
 
       try {
         const decoded = await analyzeAudioBlob(blob);
+        decodedOk = true;
         stats = decoded.stats;
         peaks = decoded.waveformPeaks;
         setSignalStats(stats);
         setWaveformPeaks(peaks);
+        setTrimStart(0);
+        setTrimEnd(Number(decoded.stats.durationSec.toFixed(1)));
+
+        const inferred = inferAudioMimeType(label, blob.type || '');
+        const alreadyCompactWav = inferred === 'audio/wav' && blob.size <= 900 * 1024;
+        if (!alreadyCompactWav && decoded.wavFallbackBlob) {
+          blobForAnalysis = decoded.wavFallbackBlob;
+        }
       } catch {
-        // Some browser/file formats may not decode cleanly via decodeAudioData;
-        // still allow server-side Gemini audio inspection.
         const fallbackPeaks = Array.from({ length: 84 }, (_, idx) =>
           0.18 + Math.abs(Math.sin(idx * 0.45)) * 0.45
         );
         peaks = fallbackPeaks;
         setWaveformPeaks(fallbackPeaks);
         setSignalStats(null);
+        setTrimStart(0);
+        setTrimEnd(0);
       }
 
+      if (!decodedOk && blob.size > 15 * 1024 * 1024) {
+        setIsAnalyzing(false);
+        setAudioBlob(null);
+        setAnalysisError(
+          'This audio format could not be decoded in your browser and is over 15 MB. Please upload a shorter clip or a standard MP3/WAV/M4A file.'
+        );
+        return;
+      }
+
+      setAudioBlob(blobForAnalysis);
+
       if (autoAnalyze) {
-        await runAnalysis(blob, label, sourceMode, stats, peaks, url);
+        await runAnalysis(blobForAnalysis, label, sourceMode, stats, peaks, url);
       }
     },
     [runAnalysis]
@@ -370,12 +425,20 @@ export const VoiceChecker: React.FC = () => {
 
   const handleFileSelected = async (file: File) => {
     setMicError(null);
-    if (!file.type.startsWith('audio/') && !/\.(wav|mp3|webm|ogg|m4a|aac|flac)$/i.test(file.name)) {
-      setAnalysisError('Please choose an audio file (.wav, .mp3, .webm, .ogg, or .m4a).');
+    setAnalysisError(null);
+    const hasAudioExt = /\.(wav|mp3|mpeg|webm|ogg|opus|m4a|mp4|mov|aac|flac|amr|3gp)$/i.test(
+      file.name
+    );
+    const isMediaMime =
+      file.type.startsWith('audio/') ||
+      file.type === 'video/mp4' ||
+      file.type === 'video/webm';
+    if (!isMediaMime && !hasAudioExt) {
+      setAnalysisError('Please choose an audio file (.wav, .mp3, .m4a, .ogg, .opus, or .webm).');
       return;
     }
-    if (file.size > 18 * 1024 * 1024) {
-      setAnalysisError('Audio file is larger than 18 MB. Please upload a shorter clip (under 60 seconds).');
+    if (file.size > 50 * 1024 * 1024) {
+      setAnalysisError('Audio file is larger than 50 MB. Please choose a smaller clip.');
       return;
     }
     await loadAudioClip(
@@ -393,10 +456,21 @@ export const VoiceChecker: React.FC = () => {
     setIsGeneratingSample(scenarioId);
 
     try {
+      const payload =
+        scenarioId === 'custom'
+          ? {
+              scenarioId: 'friend_emergency',
+              customScript,
+              customVoice,
+              customStyle,
+              customTitle: 'Custom AI Test Clip',
+            }
+          : { scenarioId };
+
       const response = await fetch('/api/generate-sample', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scenarioId }),
+        body: JSON.stringify(payload),
       });
 
       const data = await response.json();
@@ -412,6 +486,47 @@ export const VoiceChecker: React.FC = () => {
       setAnalysisError(msg);
     } finally {
       setIsGeneratingSample(null);
+    }
+  };
+
+  const handleApplyClipEdits = async () => {
+    const cleanName = draftLabel.trim() || clipLabel || 'Edited Voice Clip';
+    setClipLabel(cleanName);
+
+    if (!rawSourceBlob || !signalStats || signalStats.durationSec <= 0.6) {
+      setIsEditingClip(false);
+      return;
+    }
+
+    const total = Number(signalStats.durationSec.toFixed(1));
+    const trimmedChanged = trimStart > 0.05 || trimEnd < total - 0.1;
+
+    if (!trimmedChanged) {
+      setIsEditingClip(false);
+      return;
+    }
+
+    if (trimEnd - trimStart < 0.4) {
+      setAnalysisError('Trimmed selection must be at least 0.4 seconds long.');
+      return;
+    }
+
+    setIsTrimming(true);
+    setAnalysisError(null);
+    try {
+      const trimmedWav = await trimAudioBlobToWav(rawSourceBlob, trimStart, trimEnd);
+      await loadAudioClip(
+        trimmedWav,
+        cleanName,
+        `Trimmed segment (${trimStart.toFixed(1)}s – ${trimEnd.toFixed(1)}s)`,
+        mode,
+        true
+      );
+    } catch {
+      setAnalysisError('Could not trim this audio clip in the browser.');
+    } finally {
+      setIsTrimming(false);
+      setIsEditingClip(false);
     }
   };
 
@@ -434,10 +549,14 @@ export const VoiceChecker: React.FC = () => {
     if (audioElRef.current) {
       audioElRef.current.pause();
     }
+    setRawSourceBlob(null);
     setAudioBlob(null);
     setAudioUrl(null);
     setClipLabel('');
+    setDraftLabel('');
     setClipNote('');
+    setIsEditingClip(false);
+    setIsEditingTranscript(false);
     setWaveformPeaks([]);
     setSignalStats(null);
     setResult(null);
@@ -701,15 +820,16 @@ export const VoiceChecker: React.FC = () => {
                   Drop a voice message or audio file here
                 </h2>
                 <p className="text-sm text-slate-600 mt-1">
-                  Supports WAV, MP3, WEBM, OGG, and M4A clips up to 18 MB
+                  Supports WAV, MP3, M4A, OGG, OPUS, WEBM, and AAC clips up to 50 MB
                 </p>
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="audio/*"
+                  accept="audio/*,video/mp4,video/webm,.wav,.mp3,.m4a,.mp4,.mov,.ogg,.opus,.webm,.aac,.flac,.amr,.3gp"
                   className="hidden"
                   onChange={(e) => {
                     const selected = e.target.files?.[0];
+                    e.target.value = '';
                     if (selected) handleFileSelected(selected);
                   }}
                 />
@@ -767,6 +887,93 @@ export const VoiceChecker: React.FC = () => {
                   );
                 })}
               </div>
+
+              {/* Custom AI Script Editor */}
+              <div className="mt-4 pt-4 border-t border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setShowCustomScript((prev) => !prev)}
+                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#0284C7] hover:underline cursor-pointer"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>{showCustomScript ? 'Hide Custom Script Editor' : 'Write & Edit Custom AI Script'}</span>
+                </button>
+
+                {showCustomScript && (
+                  <div className="mt-3 p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-3">
+                    <div>
+                      <label htmlFor="custom-ai-script" className="block text-xs font-semibold text-slate-700 mb-1">
+                        Spoken Script (up to 500 characters)
+                      </label>
+                      <textarea
+                        id="custom-ai-script"
+                        rows={2}
+                        maxLength={500}
+                        value={customScript}
+                        onChange={(e) => setCustomScript(e.target.value)}
+                        className="w-full px-3 py-2 text-sm text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                        placeholder="Type what you want the AI voice to say..."
+                      />
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label htmlFor="custom-ai-voice" className="block text-xs font-semibold text-slate-700 mb-1">
+                          Voice Persona
+                        </label>
+                        <select
+                          id="custom-ai-voice"
+                          value={customVoice}
+                          onChange={(e) =>
+                            setCustomVoice(
+                              e.target.value as 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr'
+                            )
+                          }
+                          className="w-full px-3 py-2 text-sm text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                        >
+                          <option value="Puck">Puck (Energetic Student)</option>
+                          <option value="Charon">Charon (Formal Official)</option>
+                          <option value="Kore">Kore (Warm Parent)</option>
+                          <option value="Fenrir">Fenrir (Deep Speaker)</option>
+                          <option value="Zephyr">Zephyr (Calm Conversational)</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label htmlFor="custom-ai-style" className="block text-xs font-semibold text-slate-700 mb-1">
+                          Speaking Tone
+                        </label>
+                        <input
+                          id="custom-ai-style"
+                          type="text"
+                          maxLength={120}
+                          value={customStyle}
+                          onChange={(e) => setCustomStyle(e.target.value)}
+                          className="w-full px-3 py-2 text-sm text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        disabled={Boolean(isGeneratingSample) || isAnalyzing || !customScript.trim()}
+                        onClick={() => handleGenerateSample('custom')}
+                        className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        {isGeneratingSample === 'custom' ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>Generating &amp; checking...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Volume2 className="w-3.5 h-3.5" />
+                            <span>Generate &amp; Check Custom Clip</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -779,7 +986,7 @@ export const VoiceChecker: React.FC = () => {
                   {clipNote && <p className="text-xs text-slate-500 mt-0.5">{clipNote}</p>}
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
                     onClick={togglePlay}
@@ -787,6 +994,18 @@ export const VoiceChecker: React.FC = () => {
                   >
                     {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
                     <span>{isPlaying ? 'Pause' : 'Play Clip'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDraftLabel(clipLabel);
+                      setIsEditingClip((prev) => !prev);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Scissors className="w-4 h-4" />
+                    <span>{isEditingClip ? 'Close Edit' : 'Edit Clip'}</span>
                   </button>
 
                   {audioBlob && (
@@ -811,15 +1030,102 @@ export const VoiceChecker: React.FC = () => {
                           <span>Checking...</span>
                         </>
                       ) : (
-                        <span>Re-Check Voice</span>
+                        <span>{result ? 'Re-Check Voice' : 'Check Real or Fake'}</span>
                       )}
                     </button>
                   )}
                 </div>
               </div>
 
+              {/* Inline Clip Name & Audio Trim Editor */}
+              {isEditingClip && (
+                <div className="mb-4 p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-3">
+                  <div>
+                    <label htmlFor="edit-clip-name" className="block text-xs font-semibold text-slate-700 mb-1">
+                      Clip Name
+                    </label>
+                    <input
+                      id="edit-clip-name"
+                      type="text"
+                      maxLength={80}
+                      value={draftLabel}
+                      onChange={(e) => setDraftLabel(e.target.value)}
+                      className="w-full px-3 py-2 text-sm text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                    />
+                  </div>
+
+                  {signalStats && signalStats.durationSec > 0.6 && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <div className="flex items-center justify-between text-xs font-semibold text-slate-700 mb-1">
+                          <label htmlFor="trim-start-slider">Trim Start</label>
+                          <span className="font-mono tabular-nums text-slate-900">
+                            {trimStart.toFixed(1)}s
+                          </span>
+                        </div>
+                        <input
+                          id="trim-start-slider"
+                          type="range"
+                          min={0}
+                          max={Math.max(0, Number((signalStats.durationSec - 0.5).toFixed(1)))}
+                          step={0.1}
+                          value={trimStart}
+                          onChange={(e) => {
+                            const val = Number(e.target.value);
+                            setTrimStart(Math.min(val, Math.max(0, trimEnd - 0.5)));
+                          }}
+                          className="w-full accent-[#0284C7]"
+                        />
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between text-xs font-semibold text-slate-700 mb-1">
+                          <label htmlFor="trim-end-slider">Trim End</label>
+                          <span className="font-mono tabular-nums text-slate-900">
+                            {trimEnd.toFixed(1)}s
+                          </span>
+                        </div>
+                        <input
+                          id="trim-end-slider"
+                          type="range"
+                          min={0.5}
+                          max={Number(signalStats.durationSec.toFixed(1))}
+                          step={0.1}
+                          value={trimEnd}
+                          onChange={(e) => {
+                            const val = Number(e.target.value);
+                            setTrimEnd(Math.max(val, trimStart + 0.5));
+                          }}
+                          className="w-full accent-[#0284C7]"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsEditingClip(false)}
+                      className="px-3.5 py-2 text-xs font-medium text-slate-700 hover:text-slate-900 cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isTrimming || isAnalyzing}
+                      onClick={handleApplyClipEdits}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>{isTrimming ? 'Applying...' : 'Save & Apply'}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Hidden native audio element driving playback */}
               <audio
+                key={audioUrl}
                 ref={audioElRef}
                 src={audioUrl}
                 onTimeUpdate={(e) => {
@@ -905,12 +1211,32 @@ export const VoiceChecker: React.FC = () => {
 
           {/* ERROR STATE */}
           {analysisError && !isAnalyzing && (
-            <div className="mt-6 p-4 rounded-lg border border-red-200 bg-red-50 flex items-start gap-3 text-sm text-red-900">
-              <AlertTriangle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
-              <div>
-                <p className="font-semibold">Could not complete voice check</p>
-                <p className="mt-1 text-red-800">{analysisError}</p>
+            <div className="mt-6 p-4 rounded-lg border border-red-200 bg-red-50 flex items-start justify-between gap-4 text-sm text-red-900">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-semibold">Could not complete voice check</p>
+                  <p className="mt-1 text-red-800">{analysisError}</p>
+                </div>
               </div>
+              {audioBlob && audioUrl && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    runAnalysis(
+                      audioBlob,
+                      clipLabel || 'Voice Clip',
+                      mode,
+                      signalStats,
+                      waveformPeaks,
+                      audioUrl
+                    )
+                  }
+                  className="px-3.5 py-2 text-xs font-semibold text-white bg-red-700 hover:bg-red-800 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Try Again
+                </button>
+              )}
             </div>
           )}
 
@@ -951,10 +1277,41 @@ export const VoiceChecker: React.FC = () => {
 
               {/* Transcript */}
               <div className="p-4 rounded-lg border border-slate-200 bg-slate-50">
-                <div className="text-xs font-semibold text-slate-500 mb-1.5">What Was Said</div>
-                <p className="text-sm text-slate-900 leading-relaxed">
-                  &ldquo;{result.transcript}&rdquo;
-                </p>
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="text-xs font-semibold text-slate-500">What Was Said</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isEditingTranscript) {
+                        setResult((prev) =>
+                          prev
+                            ? { ...prev, transcript: draftTranscript.trim() || prev.transcript }
+                            : prev
+                        );
+                        setIsEditingTranscript(false);
+                      } else {
+                        setDraftTranscript(result.transcript);
+                        setIsEditingTranscript(true);
+                      }
+                    }}
+                    className="inline-flex items-center gap-1 text-xs font-semibold text-[#0284C7] hover:underline cursor-pointer"
+                  >
+                    <Pencil className="w-3 h-3" />
+                    <span>{isEditingTranscript ? 'Save' : 'Edit'}</span>
+                  </button>
+                </div>
+                {isEditingTranscript ? (
+                  <textarea
+                    rows={3}
+                    value={draftTranscript}
+                    onChange={(e) => setDraftTranscript(e.target.value)}
+                    className="w-full px-3 py-2 text-sm text-slate-900 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                  />
+                ) : (
+                  <p className="text-sm text-slate-900 leading-relaxed">
+                    &ldquo;{result.transcript}&rdquo;
+                  </p>
+                )}
               </div>
 
               {/* Acoustic Clues */}
